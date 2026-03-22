@@ -1,0 +1,10 @@
+ml_preprocessing/CSVS/*
+!ml_preprocessing/CSVS/.gitkeep
+
+ml_service/data/*
+!ml_service/data/.gitkeep
+
+\.env
+
+__pycache__/
+*.py[cod]
