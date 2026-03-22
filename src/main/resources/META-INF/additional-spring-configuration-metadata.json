@@ -1,0 +1,22 @@
+{"properties": [
+  {
+    "name": "security.jwt.secret-key",
+    "type": "java.lang.String",
+    "description": "A description for 'security.jwt.secret-key'"
+  },
+  {
+    "name": "app.jwt.expiration-in-ms",
+    "type": "java.lang.String",
+    "description": "A description for 'app.jwt.expiration-in-ms'"
+  },
+  {
+    "name": "app.jwt.remember-me-expiration-in-ms",
+    "type": "java.lang.String",
+    "description": "A description for 'app.jwt.remember-me-expiration-in-ms'"
+  },
+  {
+    "name": "app.frontend.url",
+    "type": "java.lang.String",
+    "description": "A description for 'app.frontend.url'"
+  }
+]}
