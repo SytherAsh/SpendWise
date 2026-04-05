@@ -18,5 +18,20 @@
     "name": "app.frontend.url",
     "type": "java.lang.String",
     "description": "A description for 'app.frontend.url'"
+  },
+  {
+    "name": "FASTAPI_BASE_URL",
+    "type": "java.lang.String",
+    "description": "A description for 'FASTAPI_BASE_URL'"
+  },
+  {
+    "name": "FASTAPI_CONNECT_TIMEOUT_MS",
+    "type": "java.lang.String",
+    "description": "A description for 'FASTAPI_CONNECT_TIMEOUT_MS'"
+  },
+  {
+    "name": "FASTAPI_READ_TIMEOUT_MS",
+    "type": "java.lang.String",
+    "description": "A description for 'FASTAPI_READ_TIMEOUT_MS'"
   }
 ]}

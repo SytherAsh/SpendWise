@@ -14,15 +14,18 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import com.spendwisebackend.spendwisebackend.user.CustomUserDetails;
 
+import io.jsonwebtoken.Claims;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class JwtFilter extends OncePerRequestFilter {
     private final JWTService jwtService;
     private final TokenBlacklistService tokenBlacklistService;
@@ -32,25 +35,23 @@ public class JwtFilter extends OncePerRequestFilter {
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
         try {
-            String token = extractTokenFromCookies(request);
-
+            String token = extractToken(request);
 
             if (token != null) {
                 if (tokenBlacklistService.isBlacklisted(token)) {
-                    response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-                    return;
-                }
-
-
-                if (SecurityContextHolder.getContext().getAuthentication() == null) {
-                    
+                    log.warn("Attempted access with blacklisted token");
+                    // Instead of returning SC_UNAUTHORIZED, we just don't set the authentication.
+                    // This allows requests to public endpoints to proceed.
+                } else if (SecurityContextHolder.getContext().getAuthentication() == null) {
                     if (jwtService.isTokenValid(token)) {
+                        Claims claims = jwtService.extractAllClaims(token);
 
-                        UUID userId = jwtService.extractUserId(token);
-                        String username = jwtService.extractUserName(token);
-                        String role = jwtService.extractRole(token);
-                        String name = jwtService.extractFullName(token);
-                        Boolean isActive = jwtService.extractIsActive(token);
+                        String userIdStr = claims.get(JWTService.CLAIM_USER_ID, String.class);
+                        UUID userId = userIdStr != null ? UUID.fromString(userIdStr) : null;
+                        String username = claims.getSubject();
+                        String role = claims.get(JWTService.CLAIM_ROLE, String.class);
+                        String name = claims.get(JWTService.CLAIM_FULL_NAME, String.class);
+                        Boolean isActive = claims.get(JWTService.CLAIM_IS_ACTIVE, Boolean.class);
 
                         if (username != null && role != null) {
                             String formattedRole = role.startsWith("ROLE_") ? role : "ROLE_" + role;
@@ -67,16 +68,28 @@ public class JwtFilter extends OncePerRequestFilter {
                             authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
                             
                             SecurityContextHolder.getContext().setAuthentication(authToken);
+                            log.debug("User {} authenticated via JWT", username);
                         }
                     }
                 }
             }
         } catch (Exception e) {
-          
+            log.error("Authentication failed: {}", e.getMessage());
             SecurityContextHolder.clearContext();
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    private String extractToken(HttpServletRequest request) {
+        // 1. Try Authorization Header
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            return authHeader.substring(7);
+        }
+
+        // 2. Fallback to Cookies
+        return extractTokenFromCookies(request);
     }
 
     private String extractTokenFromCookies(HttpServletRequest request) {
