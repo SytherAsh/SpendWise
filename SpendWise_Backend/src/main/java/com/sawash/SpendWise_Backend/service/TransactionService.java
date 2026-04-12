@@ -1,5 +1,6 @@
 package com.sawash.SpendWise_Backend.service;
 
+import com.sawash.SpendWise_Backend.client.FastApiClient;
 import com.sawash.SpendWise_Backend.dto.*;
 import com.sawash.SpendWise_Backend.entity.*;
 import com.sawash.SpendWise_Backend.exception.ResourceNotFoundException;
@@ -8,6 +9,8 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,9 +18,12 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 @RequiredArgsConstructor
 public class TransactionService {
+    private static final Logger log = LoggerFactory.getLogger(TransactionService.class);
+
     private final TransactionRepository transactionRepository;
     private final AccountRepository accountRepository;
     private final RecipientRepository recipientRepository;
+    private final FastApiClient fastApiClient;
 
     @Transactional
     public TransactionResponse create(TransactionCreateRequest req) {
@@ -33,6 +39,34 @@ public class TransactionService {
                 Recipient.builder().name(s(req.getRecipientName())).upiId(req.getUpiId()).bankName(s(req.getBank())).build()))
                 : recipientRepository.save(Recipient.builder().name(s(req.getRecipientName())).upiId(null).bankName(s(req.getBank())).build());
 
+        String description = (req.getDescription() == null || req.getDescription().isBlank()) ? req.getNote() : req.getDescription();
+        String direction = debit.compareTo(BigDecimal.ZERO) > 0 ? "DR" : "CR";
+
+        String category = "UNCATEGORIZED";
+        BigDecimal categoryConfidence = BigDecimal.ZERO;
+        String modelVersion = "fallback-v1";
+        String mlStatus = "FAILED";
+
+        try {
+            FastApiCategorizeResponse mlResponse = fastApiClient.categorize(
+                    FastApiCategorizeRequest.builder()
+                            .description(description)
+                            .amount(amount)
+                            .transactionMode(req.getTransactionMode())
+                            .drCrIndicator(direction)
+                            .build()
+            );
+
+            if (mlResponse != null && mlResponse.getCategory() != null && !mlResponse.getCategory().isBlank()) {
+                category = mlResponse.getCategory();
+                categoryConfidence = mlResponse.getConfidence() == null ? BigDecimal.ZERO : mlResponse.getConfidence();
+                modelVersion = mlResponse.getModelVersion() == null ? "dummy-v1" : mlResponse.getModelVersion();
+                mlStatus = "SUCCESS";
+            }
+        } catch (Exception ex) {
+            log.warn("Categorization failed for reference {}: {}", req.getTransactionReference(), ex.getMessage());
+        }
+
         TransactionEntity tx = TransactionEntity.builder()
                 .account(account)
                 .recipient(recipient)
@@ -43,8 +77,13 @@ public class TransactionService {
                 .credit(credit)
                 .balance(req.getBalance())
                 .transactionMode(req.getTransactionMode())
-                .drCrIndicator(debit.compareTo(BigDecimal.ZERO) > 0 ? "DR" : "CR")
+                .drCrIndicator(direction)
                 .note(req.getNote())
+                .description(description)
+                .category(category)
+                .categoryConfidence(categoryConfidence)
+                .mlModelVersion(modelVersion)
+                .mlStatus(mlStatus)
                 .build();
 
         return map(transactionRepository.save(tx));
@@ -117,6 +156,11 @@ public class TransactionService {
                 .transactionMode(tx.getTransactionMode())
                 .drCrIndicator(tx.getDrCrIndicator())
                 .note(tx.getNote())
+                .description(tx.getDescription())
+                .category(tx.getCategory())
+                .categoryConfidence(tx.getCategoryConfidence())
+                .mlModelVersion(tx.getMlModelVersion())
+                .mlStatus(tx.getMlStatus())
                 .build();
     }
 

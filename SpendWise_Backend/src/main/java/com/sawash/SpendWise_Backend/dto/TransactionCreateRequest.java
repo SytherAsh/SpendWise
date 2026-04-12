@@ -16,6 +16,7 @@ public class TransactionCreateRequest {
     private String transactionMode;
     private String drCrIndicator;
     private String note;
+    private String description;
     private String recipientName;
     private String bank;
     private String upiId;

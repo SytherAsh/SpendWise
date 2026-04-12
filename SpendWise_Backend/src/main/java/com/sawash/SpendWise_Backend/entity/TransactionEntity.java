@@ -55,6 +55,21 @@ public class TransactionEntity {
     @Column(name = "note")
     private String note;
 
+    @Column(name = "description")
+    private String description;
+
+    @Column(name = "category")
+    private String category;
+
+    @Column(name = "category_confidence")
+    private BigDecimal categoryConfidence;
+
+    @Column(name = "ml_model_version")
+    private String mlModelVersion;
+
+    @Column(name = "ml_status")
+    private String mlStatus;
+
     @Column(name = "created_at", insertable = false, updatable = false)
     private OffsetDateTime createdAt;
 }

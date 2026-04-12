@@ -21,4 +21,9 @@ public class TransactionResponse {
     String transactionMode;
     String drCrIndicator;
     String note;
+    String description;
+    String category;
+    BigDecimal categoryConfidence;
+    String mlModelVersion;
+    String mlStatus;
 }
