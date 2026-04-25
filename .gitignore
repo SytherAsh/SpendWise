@@ -8,3 +8,6 @@ ml_service/data/*
 
 __pycache__/
 *.py[cod]
+
+.idea/
+.vscode/
