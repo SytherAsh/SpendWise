@@ -5,7 +5,7 @@ from typing import List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from app.schemas.transaction import NotificationPayload, ParsedTransaction
+from app.schemas.transaction import SmsPayload, ParsedTransaction
 from app.sms_parser import parse_sms_body
 from app.supabase_client import supabase
 from app.service import create_single_transaction, safe_value
@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # -------------------------------------------------------
-# Supabase table for raw incoming notifications/SMS
+# Supabase table for raw incoming SMS
 # -------------------------------------------------------
-RAW_TABLE = "raw_notifications"
+RAW_TABLE = "raw_sms"
 
 
 class IngestResponse(BaseModel):
-    """Response after ingesting a single notification/SMS"""
+    """Response after ingesting a single SMS"""
     status: str
     raw_id: str
     is_financial: bool
@@ -29,7 +29,7 @@ class IngestResponse(BaseModel):
 
 
 class BulkIngestResponse(BaseModel):
-    """Response after ingesting a batch of notifications/SMS"""
+    """Response after ingesting a batch of SMS"""
     total: int
     financial: int
     non_financial: int
@@ -37,15 +37,12 @@ class BulkIngestResponse(BaseModel):
     errors: list[str]
 
 
-class RawNotificationOut(BaseModel):
-    """Shape returned when listing raw records"""
+class RawSmsOut(BaseModel):
+    """Shape returned when listing raw SMS records"""
     id: str
     source: str
-    package_name: str | None
     sender: str | None
-    title: str | None
     body: str
-    big_text: str | None
     timestamp_ms: int
     timestamp_human: str
     device_id: str
@@ -62,25 +59,21 @@ class RawNotificationOut(BaseModel):
 # This is the endpoint the Android app POSTs to
 # -------------------------------------------------------
 @router.post("/api/data", response_model=IngestResponse)
-async def ingest_single(payload: NotificationPayload):
+async def ingest_single(payload: SmsPayload):
     """
-    Receive a single notification or SMS from the SpendWise Android app.
+    Receive a single SMS from the SpendWise Android app.
     Parses the body for financial data and optionally creates a transaction.
     """
     try:
         # Parse the body text for financial information
-        full_text = payload.big_text or payload.body
-        parsed = parse_sms_body(full_text, sender=payload.sender)
+        parsed = parse_sms_body(payload.body, sender=payload.sender)
 
         # Build the raw record to store in Supabase
         raw_record = {
             "id": payload.id,
             "source": payload.source,
-            "package_name": payload.package_name,
             "sender": payload.sender,
-            "title": payload.title,
             "body": payload.body,
-            "big_text": payload.big_text,
             "timestamp_ms": payload.timestamp_ms,
             "timestamp_human": payload.timestamp_human,
             "device_id": payload.device_id,
@@ -97,7 +90,7 @@ async def ingest_single(payload: NotificationPayload):
 
         # Insert raw record into Supabase
         supabase.table(RAW_TABLE).upsert(raw_record).execute()
-        logger.info(f"Stored raw record: {payload.id} | financial={parsed.is_financial}")
+        logger.info(f"Stored raw SMS: {payload.id} | financial={parsed.is_financial}")
 
         # If financial, also create a proper transaction in the transactions table
         transaction_id = None
@@ -119,7 +112,7 @@ async def ingest_single(payload: NotificationPayload):
                 }
                 created = create_single_transaction(tx_data)
                 transaction_id = created.get("id")
-                logger.info(f"Created transaction {transaction_id} from {payload.id}")
+                logger.info(f"Created transaction {transaction_id} from SMS {payload.id}")
 
                 # Link the transaction ID back to the raw record
                 supabase.table(RAW_TABLE).update(
@@ -127,7 +120,7 @@ async def ingest_single(payload: NotificationPayload):
                 ).eq("id", payload.id).execute()
 
             except Exception as e:
-                logger.error(f"Failed to create transaction from {payload.id}: {e}")
+                logger.error(f"Failed to create transaction from SMS {payload.id}: {e}")
 
         return IngestResponse(
             status="ok",
@@ -146,9 +139,9 @@ async def ingest_single(payload: NotificationPayload):
 # POST /api/data/bulk — Batch ingest multiple records at once
 # -------------------------------------------------------
 @router.post("/api/data/bulk", response_model=BulkIngestResponse)
-async def ingest_bulk(payloads: List[NotificationPayload]):
+async def ingest_bulk(payloads: List[SmsPayload]):
     """
-    Receive multiple notifications/SMS in one request.
+    Receive multiple SMS in one request.
     Useful for the Android app's retry-unsent batch operation.
     """
     financial_count = 0
@@ -184,15 +177,12 @@ async def ingest_bulk(payloads: List[NotificationPayload]):
 async def list_raw(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    source: str | None = Query(default=None, description="Filter by 'sms' or 'notification'"),
     financial_only: bool = Query(default=False, description="Return only financial messages"),
     device_id: str | None = Query(default=None, description="Filter by device"),
 ):
-    """List raw captured notifications/SMS with optional filters"""
+    """List raw captured SMS with optional filters"""
     query = supabase.table(RAW_TABLE).select("*")
 
-    if source:
-        query = query.eq("source", source)
     if financial_only:
         query = query.eq("is_financial", True)
     if device_id:
@@ -232,8 +222,7 @@ async def get_raw(record_id: str):
 @router.get("/api/data/stats/summary")
 async def get_stats(device_id: str | None = Query(default=None)):
     """
-    Returns summary stats: total records, financial count,
-    breakdown by source, and recent activity.
+    Returns summary stats for SMS records.
     """
     base_query = supabase.table(RAW_TABLE)
 
@@ -251,17 +240,6 @@ async def get_stats(device_id: str | None = Query(default=None)):
     fin_result = fin_q.execute()
     financial = fin_result.count or 0
 
-    # Source breakdown — get counts per source
-    sms_q = base_query.select("id", count="exact").eq("source", "sms")
-    if device_id:
-        sms_q = sms_q.eq("device_id", device_id)
-    sms_result = sms_q.execute()
-
-    notif_q = base_query.select("id", count="exact").eq("source", "notification")
-    if device_id:
-        notif_q = notif_q.eq("device_id", device_id)
-    notif_result = notif_q.execute()
-
     # Last 5 financial records
     recent_q = (
         base_query.select("*")
@@ -274,11 +252,9 @@ async def get_stats(device_id: str | None = Query(default=None)):
     recent_result = recent_q.execute()
 
     return {
-        "total_records": total,
-        "financial_records": financial,
-        "non_financial_records": total - financial,
-        "sms_count": sms_result.count or 0,
-        "notification_count": notif_result.count or 0,
+        "total_sms": total,
+        "financial_sms": financial,
+        "non_financial_sms": total - financial,
         "recent_financial": recent_result.data or [],
     }
 
@@ -304,7 +280,7 @@ async def reparse_record(record_id: str):
         raise HTTPException(status_code=404, detail="Record not found")
 
     record = result.data[0]
-    full_text = record.get("big_text") or record.get("body", "")
+    full_text = record.get("body", "")
     sender = record.get("sender")
 
     # Re-parse with the latest parser logic

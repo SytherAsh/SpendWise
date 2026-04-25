@@ -17,19 +17,16 @@ class TransactionCreate(BaseModel):
     upi_id: Optional[str] = None
 
 
-class NotificationPayload(BaseModel):
-    """Schema matching what the SpendWise Android app sends via POST /api/data"""
-    id: str
-    source: str  # "notification" or "sms"
-    package_name: Optional[str] = None
-    sender: Optional[str] = None
-    title: Optional[str] = None
-    body: str
-    big_text: Optional[str] = None
-    timestamp_ms: int
-    timestamp_human: str
-    device_id: str
-    sent_to_backend: bool = False
+class SmsPayload(BaseModel):
+    """Schema for incoming SMS data from the mobile app"""
+    id: str                                  # Unique record ID generated on phone
+    source: str                              # Should always be "sms" now
+    sender: Optional[str] = None             # SMS sender ID (e.g. HDFCBK)
+    body: str                                # The full SMS text
+    timestamp_ms: int                        # Unix timestamp in ms
+    timestamp_human: str                     # Human readable time
+    device_id: str                           # Unique phone identifier
+    sent_to_backend: bool = False            # Local sync status
 
 
 class ParsedTransaction(BaseModel):
