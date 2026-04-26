@@ -58,80 +58,58 @@ class RawSmsOut(BaseModel):
 # POST /api/data — Single notification/SMS ingest
 # This is the endpoint the Android app POSTs to
 # -------------------------------------------------------
+import csv
+import os
+
+# Local CSV file for EDA
+CSV_FILE = "captured_sms.csv"
+
+def save_to_csv(data_dict):
+    """Appends a single record to the local CSV file"""
+    file_exists = os.path.isfile(CSV_FILE)
+    with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=data_dict.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(data_dict)
+
 @router.post("/api/data", response_model=IngestResponse)
 async def ingest_single(payload: SmsPayload):
     """
-    Receive a single SMS from the SpendWise Android app.
-    Parses the body for financial data and optionally creates a transaction.
+    Receive a single SMS and save it to a LOCAL CSV for EDA.
+    Supabase logic is currently disabled.
     """
     try:
         # Parse the body text for financial information
         parsed = parse_sms_body(payload.body, sender=payload.sender)
 
-        # Build the raw record to store in Supabase
-        raw_record = {
+        # Build the record
+        record = {
             "id": payload.id,
-            "source": payload.source,
             "sender": payload.sender,
             "body": payload.body,
-            "timestamp_ms": payload.timestamp_ms,
             "timestamp_human": payload.timestamp_human,
-            "device_id": payload.device_id,
             "is_financial": parsed.is_financial,
-            "parsed_amount": parsed.amount,
-            "parsed_direction": parsed.direction,
-            "parsed_bank": parsed.bank,
-            "parsed_mode": parsed.transaction_mode,
-            "parsed_upi_id": parsed.upi_id,
-            "parsed_recipient": parsed.recipient_name,
-            "parsed_account_suffix": parsed.account_suffix,
-            "parsed_balance": parsed.balance_after,
+            "amount": parsed.amount,
+            "direction": parsed.direction,
+            "bank": parsed.bank,
+            "upi_id": parsed.upi_id,
+            "recipient": parsed.recipient_name,
         }
 
-        # Insert raw record into Supabase
-        supabase.table(RAW_TABLE).upsert(raw_record).execute()
-        logger.info(f"Stored raw SMS: {payload.id} | financial={parsed.is_financial}")
-
-        # If financial, also create a proper transaction in the transactions table
-        transaction_id = None
-        if parsed.is_financial and parsed.amount is not None:
-            try:
-                tx_data = {
-                    "transaction_reference": payload.id,
-                    "transaction_date": _timestamp_to_date(payload.timestamp_ms),
-                    "amount": parsed.amount,
-                    "debit": parsed.amount if parsed.direction == "DEBIT" else None,
-                    "credit": parsed.amount if parsed.direction == "CREDIT" else None,
-                    "balance": parsed.balance_after,
-                    "transaction_mode": parsed.transaction_mode or "OTHER",
-                    "dr_cr_indicator": parsed.direction or "UNKNOWN",
-                    "note": payload.body[:200],
-                    "recipient_name": parsed.recipient_name,
-                    "bank": parsed.bank or "UNKNOWN",
-                    "upi_id": parsed.upi_id,
-                }
-                created = create_single_transaction(tx_data)
-                transaction_id = created.get("id")
-                logger.info(f"Created transaction {transaction_id} from SMS {payload.id}")
-
-                # Link the transaction ID back to the raw record
-                supabase.table(RAW_TABLE).update(
-                    {"transaction_id": transaction_id}
-                ).eq("id", payload.id).execute()
-
-            except Exception as e:
-                logger.error(f"Failed to create transaction from SMS {payload.id}: {e}")
+        # SAVE TO LOCAL CSV
+        save_to_csv(record)
+        logger.info(f"✅ Saved to CSV: {payload.id} | {payload.sender}")
 
         return IngestResponse(
             status="ok",
             raw_id=payload.id,
             is_financial=parsed.is_financial,
-            transaction_id=transaction_id,
             parsed=parsed,
         )
 
     except Exception as e:
-        logger.error(f"Ingest failed for {payload.id}: {e}", exc_info=True)
+        logger.error(f"Ingest failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -141,31 +119,57 @@ async def ingest_single(payload: SmsPayload):
 @router.post("/api/data/bulk", response_model=BulkIngestResponse)
 async def ingest_bulk(payloads: List[SmsPayload]):
     """
-    Receive multiple SMS in one request.
-    Useful for the Android app's retry-unsent batch operation.
+    Receive multiple SMS and save them to CSV in a single batch operation.
     """
     financial_count = 0
     non_financial_count = 0
-    tx_created = 0
     errors = []
+    records_to_save = []
 
     for payload in payloads:
         try:
-            result = await ingest_single(payload)
-            if result.is_financial:
+            parsed = parse_sms_body(payload.body, sender=payload.sender)
+            if parsed.is_financial:
                 financial_count += 1
-                if result.transaction_id:
-                    tx_created += 1
             else:
                 non_financial_count += 1
+            
+            records_to_save.append({
+                "id": payload.id,
+                "sender": payload.sender,
+                "body": payload.body,
+                "timestamp_ms": payload.timestamp_ms,
+                "timestamp_human": payload.timestamp_human,
+                "device_id": payload.device_id,
+                "is_financial": parsed.is_financial,
+                "amount": parsed.amount,
+                "direction": parsed.direction,
+                "bank": parsed.bank,
+                "upi_id": parsed.upi_id,
+                "recipient": parsed.recipient_name,
+            })
         except Exception as e:
             errors.append(f"{payload.id}: {str(e)}")
+
+    # BATCH WRITE TO CSV
+    if records_to_save:
+        try:
+            file_exists = os.path.isfile(CSV_FILE)
+            with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=records_to_save[0].keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerows(records_to_save)
+            logger.info(f"📁 Batch saved: {len(records_to_save)} records added to CSV")
+        except Exception as e:
+            logger.error(f"Failed to write batch to CSV: {e}")
+            errors.append(f"CSV_WRITE_ERROR: {str(e)}")
 
     return BulkIngestResponse(
         total=len(payloads),
         financial=financial_count,
         non_financial=non_financial_count,
-        transactions_created=tx_created,
+        transactions_created=0, # Supabase disabled
         errors=errors,
     )
 
