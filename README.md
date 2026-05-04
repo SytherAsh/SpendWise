@@ -1,46 +1,33 @@
-# SpendWise
+# SpendWise Backend Services
 
 ## Goal
-Build a personal finance platform that cleans bank-statement data, stores it in Supabase, and exposes transaction + analysis APIs through FastAPI and Spring Boot. Also create a central layer to unify UPI transactions from providers like GPay and Paytm, then deliver accurate spending categorization.
+Build a personal finance platform that cleans bank-statement data, stores it in Supabase, and exposes transaction + analysis APIs through FastAPI and Spring Boot. The system serves as a central layer to unify UPI transactions from providers like GPay and Paytm, and deliver accurate spending categorization using Regex/ML pipelines.
 
-## What is completed so far
-- Data preprocessing notebooks are available in `ml_preprocessing` for extraction, cleaning, validation, and export.
-- FastAPI service is implemented for:
-  - single transaction create
-  - list transactions (pagination)
-  - get transaction by id
-  - transaction logic view (`direction`, `effective_amount`, `size_bucket`)
-  - bulk Excel load (`/load-excel`)
-- Spring Boot backend is implemented for:
-  - create transaction
-  - get transaction by id
-  - paginated transaction list
-  - transaction logic endpoint
-- Supabase/Postgres integration is active in both services.
+## Project Structure
+- **`SpendWise_Backend/`**: Java Spring Boot API (JPA + PostgreSQL). This serves as the primary REST API layer for frontend clients (e.g., a Web Dashboard) to query parsed, structured transaction data.
+- **`ml_service/`**: Python FastAPI service. This handles data ingestion (raw SMS/Notifications from the Android app), runs preprocessing and regex matching to identify transaction details, and stores the structured data in Supabase.
+- **`ml_preprocessing/`**: Jupyter Notebooks used for data cleaning, exploratory data analysis (EDA), and preparing the Regex/ML pipelines.
 
-## Current project structure
-- `SpendWise_Backend/` → Java Spring Boot API (JPA + PostgreSQL)
-- `ml_service/` → Python FastAPI service for ingestion and logic
-- `ml_preprocessing/` → notebooks used for data cleaning and preparation
+## API Summary
 
-## API summary
+### FastAPI (`ml_service`) - Data Ingestion & Logic
+- `GET /` - Health check
+- `POST /api/data` - Single SMS/Notification ingestion (from Android)
+- `POST /api/data/bulk` - Bulk SMS ingestion (from Android)
+- `POST /transactions` - Create transaction manually
+- `GET /transactions?limit=50&offset=0` - List raw transactions
+- `GET /transactions/{transaction_id}` - Get raw transaction
+- `GET /transactions/{transaction_id}/logic` - Analyze transaction logic
+- `POST /load-excel` - Bulk load transactions from CSV/Excel
 
-### Spring Boot (`/api/transactions`)
-- `POST /api/transactions`
-- `GET /api/transactions/{id}`
-- `GET /api/transactions?page=0&size=20`
-- `GET /api/transactions/{id}/logic`
+### Spring Boot (`SpendWise_Backend`) - Client API
+- `POST /api/transactions` - Create processed transaction
+- `GET /api/transactions/{id}` - Get processed transaction
+- `GET /api/transactions?page=0&size=20` - Paginated transaction list
+- `GET /api/transactions/{id}/logic` - View transaction logic
 
-### FastAPI
-- `GET /` health
-- `POST /transactions`
-- `GET /transactions?limit=50&offset=0`
-- `GET /transactions/{transaction_id}`
-- `GET /transactions/{transaction_id}/logic`
-- `POST /load-excel`
-
-## Supabase schema
-Use this schema in your Supabase SQL editor:
+## Supabase Schema
+Run the following SQL in your Supabase project to initialize the database:
 
 ```sql
 create extension if not exists pgcrypto;
@@ -83,36 +70,42 @@ create index if not exists idx_transactions_recipient_id on transactions(recipie
 create index if not exists idx_transactions_created_at on transactions(created_at desc);
 ```
 
-## Environment variables
+## Environment Setup
 
-### Spring Boot (`SpendWise_Backend/src/main/resources/application.properties`)
-- `SPRING_DATASOURCE_URL`
-- `SPRING_DATASOURCE_USERNAME`
-- `SPRING_DATASOURCE_PASSWORD`
-- `SERVER_PORT`
-- `FASTAPI_BASE_URL`
-- `FASTAPI_CONNECT_TIMEOUT_MS`
-- `FASTAPI_READ_TIMEOUT_MS`
-
-### FastAPI (`ml_service/.env`)
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `ACCOUNT_ID`
-
-## Run locally
-
-### Spring Boot backend
-```bash
-cd SpendWise_Backend
-mvnw.cmd spring-boot:run
+### 1. FastAPI (`ml_service/.env`)
+Create a `.env` file in the `ml_service` directory:
+```env
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_KEY=your_supabase_anon_key
+ACCOUNT_ID=default_account_uuid
 ```
 
-### FastAPI service
+### 2. Spring Boot (`SpendWise_Backend/src/main/resources/application.properties`)
+Update your PostgreSQL credentials:
+```properties
+SPRING_DATASOURCE_URL=jdbc:postgresql://your_supabase_db_url:5432/postgres
+SPRING_DATASOURCE_USERNAME=postgres
+SPRING_DATASOURCE_PASSWORD=your_password
+SERVER_PORT=8080
+FASTAPI_BASE_URL=http://localhost:8000
+FASTAPI_CONNECT_TIMEOUT_MS=5000
+FASTAPI_READ_TIMEOUT_MS=5000
+```
+
+## Running Locally
+
+### Start the FastAPI Service
 ```bash
 cd ml_service
-uvicorn app.main:app --reload
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+*(Running on `0.0.0.0` allows the Android app on the same network to connect to it).*
+
+### Start the Spring Boot Backend
+```bash
+cd SpendWise_Backend
+./mvnw spring-boot:run
 ```
 
-## Notes
-- Keep credentials only in environment variables.
-- `ml_service/app/excel_loader.py` currently loads first 10 rows (`df.iloc[:10]`) for testing.
+For a comprehensive guide on how the whole system connects, see `walkthrough.md`.

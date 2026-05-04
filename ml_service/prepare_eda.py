@@ -108,6 +108,22 @@ def prepare_data_for_eda(input_file="captured_sms.csv", output_file="clean_sms_e
     cols_to_drop = ['parsed_is_financial', 'parsed_amount', 'parsed_direction', 'parsed_ref_id', 'parsed_entity']
     df = df.drop(columns=cols_to_drop)
 
+    # 6. Cross-Platform Deduplication
+    # Group identical amounts/directions within a 2-minute window (120,000 ms)
+    pre_dedup_count = len(df)
+    
+    # Cast timestamp_ms to numeric safely to avoid TypeError: 'str' and 'int'
+    df['time_bucket_2m'] = pd.to_numeric(df['timestamp_ms'], errors='coerce').fillna(0) // 120000
+    
+    # We only care about deduplicating actual financial transactions
+    # We leave non-financial ones alone or just deduplicate everything
+    df = df.drop_duplicates(subset=['amount', 'direction', 'time_bucket_2m'])
+    df = df.drop(columns=['time_bucket_2m'])
+    
+    cross_dup_count = pre_dedup_count - len(df)
+    if cross_dup_count > 0:
+        print(f"🧹 Removed {cross_dup_count} cross-platform duplicates (SMS + Notification overlap).")
+
     # 6. Save clean version
     df.to_csv(output_file, index=False)
     print(f"✅ Success! Clean data saved to: {output_file}")
