@@ -6,6 +6,36 @@ from app.schemas.transaction import ParsedTransaction
 
 logger = logging.getLogger(__name__)
 
+from datetime import datetime
+
+def is_valid_year(timestamp_ms: Any, target_year: int = 2026) -> bool:
+    """
+    Checks if a timestamp belongs to the target_year.
+    Handles both epoch milliseconds and basic string formats safely.
+    If missing or invalid, returns False.
+    """
+    if not timestamp_ms:
+        return False
+        
+    try:
+        # Try to parse as float/integer (milliseconds)
+        ms = float(timestamp_ms)
+        # Assuming timestamps are in milliseconds
+        dt = datetime.fromtimestamp(ms / 1000.0)
+        return dt.year == target_year
+    except Exception:
+        pass
+        
+    try:
+        # Fallback for string formats if passed as an ISO string
+        dt = datetime.fromisoformat(str(timestamp_ms).replace('Z', '+00:00'))
+        return dt.year == target_year
+    except Exception:
+        pass
+        
+    # Last resort, basic string check for the year
+    return str(target_year) in str(timestamp_ms)
+
 # -------------------------------------------------------
 # Bank sender-ID mapping — maps SMS sender codes to bank names
 # -------------------------------------------------------
@@ -138,12 +168,16 @@ def _extract_recipient_from_body(body: str) -> Optional[str]:
     return None
 
 
-def parse_sms_body(body: str, sender: Optional[str] = None) -> ParsedTransaction:
+def parse_sms_body(body: Optional[str], sender: Optional[str] = None) -> ParsedTransaction:
     """
     Parse a raw SMS or notification body into structured transaction fields.
     Returns a ParsedTransaction with all extracted data.
     """
     result = ParsedTransaction()
+
+    if not body:
+        result.is_financial = False
+        return result
 
     # Check if this is a financial message at all
     if not FINANCIAL_KEYWORDS.search(body):

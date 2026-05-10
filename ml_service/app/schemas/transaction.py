@@ -1,3 +1,4 @@
+
 from pydantic import BaseModel
 from typing import Optional
 
@@ -22,8 +23,8 @@ class SmsPayload(BaseModel):
     id: str                                  # Unique record ID generated on phone
     source: str                              # Should always be "sms" now
     sender: Optional[str] = None             # SMS sender ID (e.g. HDFCBK)
-    body: str                                # The full SMS text
-    timestamp_ms: int                        # Unix timestamp in ms
+    body: Optional[str] = None               # The full SMS text
+    timestamp_ms: int | str                  # Unix timestamp in ms or date string
     timestamp_human: str                     # Human readable time
     device_id: str                           # Unique phone identifier
     sent_to_backend: bool = False            # Local sync status
