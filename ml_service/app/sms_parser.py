@@ -1,58 +1,43 @@
-import re
+"""
+sms_parser.py — Hardened SMS parsing with centralized compiled regex.
+
+All patterns are compiled once at module load for performance.
+Returns a ParsedTransaction with all fields safely extracted.
+"""
+from __future__ import annotations
+
+import hashlib
 import logging
-from typing import Optional, Dict, Any
+import re
+from typing import Dict, Optional, Any
 
 from app.schemas.transaction import ParsedTransaction
 
 logger = logging.getLogger(__name__)
 
-from datetime import datetime
-
-def is_valid_year(timestamp_ms: Any, target_year: int = 2026) -> bool:
-    """
-    Checks if a timestamp belongs to the target_year.
-    Handles both epoch milliseconds and basic string formats safely.
-    If missing or invalid, returns False.
-    """
-    if not timestamp_ms:
-        return False
-        
-    try:
-        # Try to parse as float/integer (milliseconds)
-        ms = float(timestamp_ms)
-        # Assuming timestamps are in milliseconds
-        dt = datetime.fromtimestamp(ms / 1000.0)
-        return dt.year == target_year
-    except Exception:
-        pass
-        
-    try:
-        # Fallback for string formats if passed as an ISO string
-        dt = datetime.fromisoformat(str(timestamp_ms).replace('Z', '+00:00'))
-        return dt.year == target_year
-    except Exception:
-        pass
-        
-    # Last resort, basic string check for the year
-    return str(target_year) in str(timestamp_ms)
 
 # -------------------------------------------------------
-# Bank sender-ID mapping — maps SMS sender codes to bank names
+# Bank sender-ID → bank name mapping (centralized)
 # -------------------------------------------------------
 SENDER_TO_BANK: Dict[str, str] = {
-    "HDFCBK": "HDFC",
-    "HDFCBN": "HDFC",
-    "SBIINB": "SBI",
-    "SBIPSG": "SBI",
-    "SBIUPI": "SBI",
-    "ICICIB": "ICICI",
-    "ICICIS": "ICICI",
-    "AXISBK": "AXIS",
-    "PAYTM":  "PAYTM",
-    "GPAY":   "GPAY",
+    # HDFC
+    "HDFCBK": "HDFC", "HDFCBN": "HDFC", "HDFCSC": "HDFC",
+    # SBI
+    "SBIINB": "SBI",  "SBIPSG": "SBI",  "SBIUPI": "SBI",
+    "SBISMS": "SBI",
+    # ICICI
+    "ICICIB": "ICICI", "ICICIS": "ICICI", "ICICIT": "ICICI",
+    # AXIS
+    "AXISBK": "AXIS", "AXISBN": "AXIS",
+    # KOTAK
+    "KOTAKB": "KOTAK", "KOTAKS": "KOTAK",
+    # YES
+    "YESBNK": "YES", "YESBAK": "YES",
+    # Payments / wallets
+    "PAYTM":   "PAYTM",
+    "GPAY":    "GPAY",
     "PHONEPE": "PHONEPE",
-    "KOTAKB": "KOTAK",
-    "YESBNK": "YES",
+    # Other banks
     "INDBNK": "INDIAN",
     "BOIIND": "BOI",
     "PNBSMS": "PNB",
@@ -61,181 +46,396 @@ SENDER_TO_BANK: Dict[str, str] = {
     "UBOI":   "UNION",
     "IDFCFB": "IDFC",
     "FEDBK":  "FEDERAL",
+    "BANDNK": "BANDHAN",
+    "RBLBNK": "RBL",
+    "DENABN": "DENA",
+    "SYNBNK": "SYNDICATE",
 }
 
+# Body-level bank name scan (order matters — longer first to avoid partial matches)
+BODY_BANK_KEYWORDS = [
+    ("PHONEPE", "PHONEPE"),
+    ("HDFC",    "HDFC"),
+    ("ICICI",   "ICICI"),
+    ("AXIS",    "AXIS"),
+    ("KOTAK",   "KOTAK"),
+    ("BANDHAN", "BANDHAN"),
+    ("YES BANK","YES"),
+    ("SBI",     "SBI"),
+    ("PNB",     "PNB"),
+    ("BOI",     "BOI"),
+    ("CANARA",  "CANARA"),
+    ("UNION",   "UNION"),
+    ("IDFC",    "IDFC"),
+    ("FEDERAL", "FEDERAL"),
+    ("PAYTM",   "PAYTM"),
+    ("GPAY",    "GPAY"),
+]
+
+
 # -------------------------------------------------------
-# Regex patterns for extracting financial data from SMS body
+# Centralized compiled regex patterns
 # -------------------------------------------------------
 
-# Matches amounts like Rs.500, Rs 1,500.00, INR 2000, ₹3,000.50
+# Amount: Rs.500, Rs 1,500.00, INR 2000, ₹3,000.50, "debited by 500"
 AMOUNT_PATTERN = re.compile(
-    r"(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE
+    r"(?:Rs\.?\s*|INR\s*|₹\s*)([0-9,]+(?:\.[0-9]{1,2})?)"
+    r"|(?:debited by|credited (?:with|by))\s+([0-9,]+(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE | re.UNICODE,
 )
 
-# Matches available balance like "Avl Bal Rs.12,345.67" or "balance is INR 500"
+# Available balance — matches "Avl Bal Rs.12,345.67", "balance is INR 500", "Avl Amt Rs.100"
 BALANCE_PATTERN = re.compile(
-    r"(?:(?:avl|avail(?:able)?|a/c)\s*(?:bal(?:ance)?|amt)[\s:]*|balance\s+(?:is\s+)?)"
-    r"(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)",
-    re.IGNORECASE,
+    r"(?:avl\.?\s*(?:bal(?:ance)?|amt)|avail(?:able)?\s*bal(?:ance)?|balance\s+(?:is\s+)?)"
+    r"[\s:]*(?:Rs\.?\s*|INR\s*|₹\s*)([0-9,]+(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE | re.UNICODE,
 )
 
-# Matches account or card suffixes like "a/c XX1234", "acct *5678", "card ending 9012"
+# Account / card suffix — "a/c XX1234", "acct *5678", "card ending 9012", "A/c X7686"
 ACCOUNT_PATTERN = re.compile(
-    r"(?:a/?c|acct|account|card)\s*(?:no\.?\s*)?(?:[Xx*]*\s*)?(\d{4,6})",
+    r"(?:a/?c|acct|account|card)\s*(?:no\.?\s*)?(?:[X*x]+\s*)([0-9]{4,6})"
+    r"|(?:ending|last\s+(?:4|four)\s+digits?)\s+(?:with\s+)?([0-9]{4})",
     re.IGNORECASE,
 )
 
-# Matches UPI IDs like "name@upi", "user@oksbi", "shop@ybl"
+# UPI ID — user@oksbi, abc@ybl, name@paytm  (exclude email TLDs)
 UPI_PATTERN = re.compile(
-    r"([a-zA-Z0-9._-]+@[a-zA-Z]{2,})",
+    r"\b([a-zA-Z0-9._-]+@(?!(?:com|org|net|in|co|gov|edu)\b)[a-zA-Z]{2,20})\b",
     re.IGNORECASE,
 )
 
-# Matches transaction modes like UPI, IMPS, NEFT, RTGS, POS etc.
+# Transaction mode — order longest first to avoid POS → OS mishap
 MODE_PATTERN = re.compile(
-    r"\b(UPI|IMPS|NEFT|RTGS|ATM|POS|NACH|ECS|CHQ|CHEQUE|ACH)\b",
+    r"\b(NETBANKING|NET\s*BANKING|PHONEPE|PAYTM|NEFT|RTGS|IMPS|NACH|CASH"
+    r"|WALLET|CHEQUE|CHQ|ACH|ECS|UPI|ATM|POS|CARD)\b",
     re.IGNORECASE,
 )
 
-# Keywords indicating debit transactions
+# Normalize extracted mode tokens
+MODE_ALIASES: Dict[str, str] = {
+    "NET BANKING": "NETBANKING",
+    "CHQ": "CHEQUE",
+    "POS": "CARD",         # POS terminal = card transaction
+}
+
+# Debit signal words
 DEBIT_KEYWORDS = re.compile(
-    r"\b(debit(?:ed)?|spent|paid|sent|withdraw(?:n|al)?|purchase|charged|transferred)\b",
+    r"\b(debit(?:ed)?|spent|paid|sent|withdraw(?:n|al)?|purchase(?:d)?"
+    r"|charged|transfer(?:red)?|deducted)\b",
     re.IGNORECASE,
 )
 
-# Keywords indicating credit transactions
+# Credit signal words
 CREDIT_KEYWORDS = re.compile(
-    r"\b(credit(?:ed)?|received|deposited|refund(?:ed)?|cashback|reversed|added)\b",
+    r"\b(credit(?:ed)?|received|deposited|refund(?:ed)?|cashback"
+    r"|reversed|added|received)\b",
     re.IGNORECASE,
 )
 
-# Keywords that identify a message as financial — used for filtering
+# Financial message gate — must match at least one of these to proceed
 FINANCIAL_KEYWORDS = re.compile(
-    r"(?:debit|credit|UPI|IMPS|NEFT|RTGS|Rs\.?|INR|₹|transaction|payment|"
-    r"withdraw|a/?c\s*\w*\d{4}|balance|transfer|ATM|POS)",
+    r"(?:debit|credit|UPI|IMPS|NEFT|RTGS|Rs\.?|INR|₹|transaction|payment"
+    r"|withdraw|a/?c\s*[X*]*\d{4}|balance|transfer|ATM|POS|debited by|credited)",
     re.IGNORECASE,
 )
 
+# Reference / transaction ID — common Indian bank SMS formats
+REF_PATTERN = re.compile(
+    r"(?:Ref(?:\s*No)?|RefNo|Txn\s*(?:ID|No\.?)|Transaction\s*ID|UPI\s*Ref"
+    r"|TxnNo|UTR|IMPS\s*Ref)[:\s-]*([A-Za-z0-9]{6,20})",
+    re.IGNORECASE,
+)
+
+# Recipient extraction — "to NAME", "paid to SHOP", "trf to ENTITY"
+RECIPIENT_DEBIT_PATTERNS = [
+    re.compile(
+        r"(?:trf\s+to|transfer(?:red)?\s+to|paid\s+to|sent\s+to|to)\s+"
+        r"([A-Za-z][A-Za-z0-9 &'._-]{1,35})",
+        re.IGNORECASE,
+    ),
+]
+
+RECIPIENT_CREDIT_PATTERNS = [
+    re.compile(
+        r"(?:from|received\s+from|credited\s+(?:from|by)|by\s+a/c\s+linked\s+to)\s+"
+        r"([A-Za-z][A-Za-z0-9 &'._-]{1,35})",
+        re.IGNORECASE,
+    ),
+]
+
+# Words that terminate a recipient name
+RECIPIENT_TERMINATORS = re.compile(
+    r"\s+(?:on|ref|via|txn|at|for|Refno|using|through|dated)\b",
+    re.IGNORECASE,
+)
+
+# Spam/ad message indicators (sender or body)
+SPAM_SENDER_PATTERN = re.compile(
+    r"(?:AIRTEL|JIO|VI|650025|BURKIN|ZUDIO|PTRENG|TATASKY|TATSKY|AMAZON)",
+    re.IGNORECASE,
+)
+SPAM_BODY_PATTERN = re.compile(
+    r"(?:recharge|data\s*pack|data\s*loan|validity|playlist|subscription|claim"
+    r"|OTT|netflix|jiohotstar|zee5|apple\s*music|free\s*access|call\s*alert"
+    r"|hello\s*tune|missed\s*call|offer\s*expires|cashback\s*offer|discount\s*code)",
+    re.IGNORECASE,
+)
+
+
+# -------------------------------------------------------
+# Public helpers
+# -------------------------------------------------------
+
+def normalize_timestamp(timestamp_ms: Any) -> Optional[str]:
+    """
+    Convert epoch milliseconds or ISO string to UTC ISO 8601 string.
+
+    Returns a timezone-aware string like "2026-01-01T15:37:29+00:00"
+    or None if conversion fails.
+    """
+    from datetime import datetime, timezone
+
+    if timestamp_ms is None:
+        return None
+
+    # Try epoch milliseconds
+    try:
+        ms = float(timestamp_ms)
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        return dt.isoformat()
+    except (TypeError, ValueError, OSError):
+        pass
+
+    # Try ISO string
+    try:
+        s = str(timestamp_ms).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except (ValueError, AttributeError):
+        pass
+
+    return None
+
+
+def is_valid_year(timestamp_ms: Any, target_year: int = 2026) -> bool:
+    """Check if a timestamp belongs to the target year."""
+    if not timestamp_ms:
+        return False
+    iso = normalize_timestamp(timestamp_ms)
+    if iso:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(iso)
+            return dt.year == target_year
+        except Exception:
+            pass
+    return str(target_year) in str(timestamp_ms)
+
+
+def sms_body_hash(body: Optional[str], sender: Optional[str] = None) -> str:
+    """SHA-256 of the normalised body+sender — used as a dedup key."""
+    text = f"{(sender or '').strip().upper()}|{(body or '').strip()}"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# -------------------------------------------------------
+# Private extraction helpers
+# -------------------------------------------------------
 
 def _parse_amount(text: str) -> float:
-    """Remove commas from amount string and convert to float"""
-    return float(text.replace(",", ""))
+    """Remove commas and convert to float."""
+    return float(text.replace(",", "").strip())
 
 
 def _detect_bank_from_sender(sender: Optional[str]) -> Optional[str]:
-    """Map an SMS sender ID to a known bank name"""
+    """Map an SMS sender code to a known bank name."""
     if not sender:
         return None
-    sender_upper = sender.upper().strip()
-    # Direct match on known sender codes
+    upper = sender.upper().strip()
     for code, bank in SENDER_TO_BANK.items():
-        if code in sender_upper:
+        if code in upper:
             return bank
     return None
 
 
 def _detect_bank_from_body(body: str) -> Optional[str]:
-    """Try to extract bank name from the message body itself"""
-    body_upper = body.upper()
-    bank_names = [
-        ("HDFC", "HDFC"), ("SBI", "SBI"), ("ICICI", "ICICI"),
-        ("AXIS", "AXIS"), ("KOTAK", "KOTAK"), ("YES BANK", "YES"),
-        ("PNB", "PNB"), ("BOI", "BOI"), ("CANARA", "CANARA"),
-        ("UNION", "UNION"), ("IDFC", "IDFC"), ("FEDERAL", "FEDERAL"),
-        ("PAYTM", "PAYTM"), ("PHONEPE", "PHONEPE"), ("GPAY", "GPAY"),
-    ]
-    for keyword, bank in bank_names:
-        if keyword in body_upper:
+    """Scan body text for known bank names."""
+    upper = body.upper()
+    for keyword, bank in BODY_BANK_KEYWORDS:
+        if keyword in upper:
             return bank
     return None
 
 
-def _extract_recipient_from_body(body: str) -> Optional[str]:
-    """Extract recipient/payee name from common SMS patterns"""
-    # Patterns like "to NAME" or "to VPA name@upi"
-    patterns = [
-        re.compile(r"(?:to|paid to|sent to|transferred to)\s+([A-Za-z][A-Za-z0-9 _.]{2,30})", re.IGNORECASE),
-        re.compile(r"(?:from|received from|credited by)\s+([A-Za-z][A-Za-z0-9 _.]{2,30})", re.IGNORECASE),
-    ]
+def _extract_first_amount(body: str) -> Optional[float]:
+    """
+    Return the first (usually transaction) amount from the SMS body.
+    Handles Rs., INR, ₹ prefixes and 'debited by / credited with N' patterns.
+    """
+    for m in AMOUNT_PATTERN.finditer(body):
+        raw = m.group(1) or m.group(2)
+        if raw:
+            try:
+                return _parse_amount(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_balance(body: str) -> Optional[float]:
+    """Extract available balance if present."""
+    m = BALANCE_PATTERN.search(body)
+    if m:
+        try:
+            return _parse_amount(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_account_suffix(body: str) -> Optional[str]:
+    """Return last-4 digits of account/card mentioned in the SMS."""
+    m = ACCOUNT_PATTERN.search(body)
+    if m:
+        digits = m.group(1) or m.group(2)
+        if digits:
+            return digits[-4:]
+    return None
+
+
+def _extract_upi_id(body: str) -> Optional[str]:
+    """Extract UPI VPA from the SMS body."""
+    m = UPI_PATTERN.search(body)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_mode(body: str) -> Optional[str]:
+    """Extract transaction mode (UPI, IMPS, NEFT …) from body."""
+    m = MODE_PATTERN.search(body)
+    if m:
+        raw = m.group(1).upper().replace(" ", "")
+        # Resolve aliases
+        return MODE_ALIASES.get(raw, raw)
+    return None
+
+
+def _extract_ref_id(body: str) -> Optional[str]:
+    """Extract reference / transaction ID from the SMS body."""
+    m = REF_PATTERN.search(body)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_recipient(body: str, direction: Optional[str]) -> Optional[str]:
+    """Extract recipient name based on detected direction."""
+    patterns = (
+        RECIPIENT_DEBIT_PATTERNS
+        if direction == "DEBIT"
+        else RECIPIENT_CREDIT_PATTERNS
+        if direction == "CREDIT"
+        else RECIPIENT_DEBIT_PATTERNS + RECIPIENT_CREDIT_PATTERNS
+    )
+
     for pat in patterns:
-        match = pat.search(body)
-        if match:
-            name = match.group(1).strip()
-            # Stop at common terminators like "on", "ref", "via"
-            name = re.split(r"\s+(?:on|ref|via|txn|at|for)\b", name, flags=re.IGNORECASE)[0].strip()
+        m = pat.search(body)
+        if m:
+            name = m.group(1).strip()
+            # Trim at terminators (Ref, on, via …)
+            name = RECIPIENT_TERMINATORS.split(name)[0].strip()
             if len(name) >= 2:
                 return name
     return None
 
 
+def _is_spam(body: str, sender: Optional[str]) -> bool:
+    """Return True if the message looks like an ad / promotional spam."""
+    if sender and SPAM_SENDER_PATTERN.search(sender):
+        # Some bank senders share roots with telcos — only flag if no financial kwds
+        if not FINANCIAL_KEYWORDS.search(body or ""):
+            return True
+    if SPAM_BODY_PATTERN.search(body or ""):
+        return True
+    return False
+
+
+# -------------------------------------------------------
+# Public entry point
+# -------------------------------------------------------
+
 def parse_sms_body(body: Optional[str], sender: Optional[str] = None) -> ParsedTransaction:
     """
     Parse a raw SMS or notification body into structured transaction fields.
-    Returns a ParsedTransaction with all extracted data.
+
+    Args:
+        body:   Full raw SMS text.
+        sender: SMS sender ID (e.g. "JD-SBIUPI-S").
+
+    Returns:
+        ParsedTransaction — all fields are Optional; is_financial=False if not financial.
     """
     result = ParsedTransaction()
 
     if not body:
-        result.is_financial = False
         return result
 
-    # Check if this is a financial message at all
+    # Gate 1 — must contain at least one financial keyword
     if not FINANCIAL_KEYWORDS.search(body):
-        result.is_financial = False
+        return result
+
+    # Gate 2 — reject spam / promotions
+    if _is_spam(body, sender):
+        logger.debug("Skipping spam/promotional message from sender=%s", sender)
         return result
 
     result.is_financial = True
 
-    # Extract amount — take the first match (usually the transaction amount)
-    amounts = AMOUNT_PATTERN.findall(body)
-    if amounts:
-        try:
-            result.amount = _parse_amount(amounts[0])
-        except ValueError:
-            pass
+    # --- Amount ---
+    result.amount = _extract_first_amount(body)
 
-    # Determine debit or credit direction
+    # --- Direction ---
     if DEBIT_KEYWORDS.search(body):
         result.direction = "DEBIT"
     elif CREDIT_KEYWORDS.search(body):
         result.direction = "CREDIT"
 
-    # Extract bank name from sender first, then body as fallback
+    # Sanity: if no amount or no direction, not a true financial transaction
+    if result.amount is None or result.direction is None:
+        result.is_financial = False
+
+    # --- Bank ---
     result.bank = _detect_bank_from_sender(sender) or _detect_bank_from_body(body)
 
-    # Extract UPI ID if present
-    upi_match = UPI_PATTERN.search(body)
-    if upi_match:
-        upi_id = upi_match.group(1)
-        # Filter out email-like false positives
-        if not upi_id.endswith((".com", ".org", ".net", ".in", ".co")):
-            result.upi_id = upi_id
+    # --- UPI ID ---
+    result.upi_id = _extract_upi_id(body)
 
-    # Extract transaction mode (UPI, IMPS, NEFT etc.)
-    mode_match = MODE_PATTERN.search(body)
-    if mode_match:
-        result.transaction_mode = mode_match.group(1).upper()
+    # --- Transaction mode ---
+    result.transaction_mode = _extract_mode(body)
 
-    # Extract account suffix (last 4-6 digits)
-    acct_match = ACCOUNT_PATTERN.search(body)
-    if acct_match:
-        result.account_suffix = acct_match.group(1)
+    # --- Account suffix ---
+    result.account_suffix = _extract_account_suffix(body)
 
-    # Extract balance after transaction
-    bal_match = BALANCE_PATTERN.search(body)
-    if bal_match:
-        try:
-            result.balance_after = _parse_amount(bal_match.group(1))
-        except ValueError:
-            pass
+    # --- Balance ---
+    result.balance_after = _extract_balance(body)
 
-    # Extract recipient name
-    result.recipient_name = _extract_recipient_from_body(body)
+    # --- Reference ID ---
+    result.ref_id = _extract_ref_id(body)
+
+    # --- Recipient ---
+    result.recipient_name = _extract_recipient(body, result.direction)
 
     logger.info(
-        f"Parsed: amt={result.amount}, dir={result.direction}, "
-        f"bank={result.bank}, mode={result.transaction_mode}, "
-        f"financial={result.is_financial}"
+        "Parsed SMS | financial=%s | amt=%.2f | dir=%s | bank=%s | mode=%s | ref=%s",
+        result.is_financial,
+        result.amount or 0.0,
+        result.direction,
+        result.bank,
+        result.transaction_mode,
+        result.ref_id,
     )
 
     return result

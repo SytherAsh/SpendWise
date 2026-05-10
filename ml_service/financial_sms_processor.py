@@ -1,156 +1,312 @@
-import pandas as pd
-import numpy as np
+"""
+financial_sms_processor.py — Batch processor for CSV-based SMS pipeline.
+
+Reads captured_sms.csv, deduplicates, parses, and writes:
+  - clean_sms_eda.csv       (all records, cleaned)
+  - true_financial_sms.csv  (only true financial transactions)
+
+Optionally bulk-pushes financial transactions to Supabase.
+The CSV pipeline is entirely independent of Supabase availability.
+"""
+from __future__ import annotations
+
+import logging
 import os
 import re
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
 
 class FinancialSmsProcessor:
     """
     Handles processing of raw SMS/Notification data to extract precise
     financial details, segregate spam, and deduplicate cross-platform entries.
     """
-    
-    def __init__(self, input_file="captured_sms.csv", output_file="clean_sms_eda.csv", financial_output_file="true_financial_sms.csv"):
-        self.input_file = input_file
-        self.output_file = output_file
+
+    def __init__(
+        self,
+        input_file: str = "captured_sms.csv",
+        output_file: str = "clean_sms_eda.csv",
+        financial_output_file: str = "true_financial_sms.csv",
+    ):
+        self.input_file            = input_file
+        self.output_file           = output_file
         self.financial_output_file = financial_output_file
 
-    def _parse_financial_sms(self, df):
-        """
-        Parses the SMS body using Regex to extract precise financial details
-        and accurately segregate financial from non-financial messages.
-        """
-        # Ensure body and sender are strings
-        df['body'] = df['body'].fillna('').astype(str)
-        df['sender'] = df['sender'].fillna('').astype(str)
+    # ------------------------------------------------------------------
+    # Internal parsing
+    # ------------------------------------------------------------------
 
-        # 1. Base rule: identify explicit spam/ads based on common keywords
-        ad_keywords = r'(?i)(?:recharge|data pack|data loan|validity|playlist|subscription|claim|ott|netflix|jiohotstar|zee5|apple music|free access|call alert|hello tune|missed call)'
-        
-        # 2. Amount Extraction
-        amount_pattern = r'(?i)(?:Rs\.?|INR)\s*([\d,]+\.?\d*)'
-        alt_amount_pattern = r'(?i)(?:debited by|credited by)\s*([\d,]+\.?\d*)'
-        
-        amt_match = df['body'].str.extract(amount_pattern)[0]
-        alt_amt_match = df['body'].str.extract(alt_amount_pattern)[0]
-        df['parsed_amount'] = amt_match.fillna(alt_amt_match)
-        df['parsed_amount'] = pd.to_numeric(df['parsed_amount'].str.replace(',', '', regex=False), errors='coerce')
-        
-        # 3. Direction Extraction (Credit / Debit)
-        debit_keywords = r'(?i)(?:debited|deducted|paid|spent|withdrawn)'
-        credit_keywords = r'(?i)(?:credited|received|added|refunded)'
-        
+    def _parse_financial_sms(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Use centralized regex from sms_parser to extract precise financial
+        details and accurately segregate financial from non-financial messages.
+
+        Prefers the hardened sms_parser logic over inline regex; falls back
+        gracefully if the import fails.
+        """
+        df["body"]   = df["body"].fillna("").astype(str)
+        df["sender"] = df["sender"].fillna("").astype(str)
+
+        # -- Ad / spam detection (body + sender level) --
+        ad_keywords_body = re.compile(
+            r"(?:recharge|data\s*pack|data\s*loan|validity|playlist|subscription|claim"
+            r"|OTT|netflix|jiohotstar|zee5|apple\s*music|free\s*access|call\s*alert"
+            r"|hello\s*tune|missed\s*call|offer\s*expires|cashback\s*offer|discount\s*code)",
+            re.IGNORECASE,
+        )
+        ad_sender = re.compile(
+            r"(?:AIRTEL|JIO|VI|650025|BURKIN|ZUDIO|PTRENG|TATASKY|TATSKY|AMAZON)",
+            re.IGNORECASE,
+        )
+
+        # -- Amount extraction --
+        # Handles: Rs.500, Rs 1,500.00, INR 2000, ₹3,000.50, "debited by 500"
+        amount_pattern     = r"(?:Rs\.?\s*|INR\s*|₹\s*)([0-9,]+(?:\.[0-9]{1,2})?)"
+        alt_amount_pattern = r"(?:debited by|credited (?:with|by))\s+([0-9,]+(?:\.[0-9]{1,2})?)"
+
+        amt_match      = df["body"].str.extract(amount_pattern, flags=re.IGNORECASE)[0]
+        alt_amt_match  = df["body"].str.extract(alt_amount_pattern, flags=re.IGNORECASE)[0]
+        df["parsed_amount"] = amt_match.fillna(alt_amt_match)
+        df["parsed_amount"] = pd.to_numeric(
+            df["parsed_amount"].str.replace(",", "", regex=False), errors="coerce"
+        )
+
+        # -- Direction extraction --
+        debit_kw  = r"(?i)\b(?:debited?|deducted|paid|spent|withdrawn?|withdraw|transferred?|purchase(?:d)?|charged)\b"
+        credit_kw = r"(?i)\b(?:credited?|received|added|refunded?|cashback|reversed|deposited)\b"
+
         conditions = [
-            df['body'].str.contains(debit_keywords, na=False),
-            df['body'].str.contains(credit_keywords, na=False)
+            df["body"].str.contains(debit_kw,  na=False, regex=True),
+            df["body"].str.contains(credit_kw, na=False, regex=True),
         ]
-        choices = ['DEBIT', 'CREDIT']
-        df['parsed_direction'] = np.select(conditions, choices, default=None)
-        
-        # 4. Reference ID Extraction
-        ref_pattern = r'(?i)(?:Refno|Ref No|Txn ID|Transaction ID|UPI Ref|TxnNo)\s*[:\-]?\s*([A-Za-z0-9]+)'
-        df['parsed_ref_id'] = df['body'].str.extract(ref_pattern)[0]
-        
-        # 5. Entity Extraction (Recipient/Sender)
-        entity_debit_pattern = r'(?i)(?:trf to|transfer to|transferred to)\s+(.*?)\s+(?:Refno|Ref |UPI|Txn|Avl|dt\s|\()'
-        entity_credit_pattern = r'(?i)(?:transfer from|by a/c linked to)\s+(.*?)\s+(?:Ref No|Ref |UPI|Txn|\()'
-        
-        ent_debit = df['body'].str.extract(entity_debit_pattern)[0]
-        ent_credit = df['body'].str.extract(entity_credit_pattern)[0]
-        
-        sender_clean = df['sender'].str.replace(r'^[A-Z]{2}-|-?[A-Z]$', '', regex=True)
-        df['parsed_entity'] = ent_debit.fillna(ent_credit).fillna(sender_clean)
-        
-        # 6. Final Financial Labeling
-        is_ad = df['body'].str.contains(ad_keywords, na=False) | df['sender'].str.contains(r'(?i)(?:AIRTEL|JIO|VI|650025|BURKIN|ZUDIO|PTRENG)', na=False)
-        has_financial_info = df['parsed_amount'].notna() & df['parsed_direction'].notna() & (df['parsed_amount'] > 0)
-        df['parsed_is_financial'] = has_financial_info & (~is_ad)
-        
+        choices = ["DEBIT", "CREDIT"]
+        df["parsed_direction"] = np.select(conditions, choices, default=None)
+        df["parsed_direction"]  = df["parsed_direction"].replace("None", None)
+
+        # -- Reference ID extraction --
+        ref_pattern = (
+            r"(?:Ref(?:\s*No)?|RefNo|Txn\s*(?:ID|No\.?)|Transaction\s*ID"
+            r"|UPI\s*Ref|TxnNo|UTR|IMPS\s*Ref)[:\s-]*([A-Za-z0-9]{6,20})"
+        )
+        df["parsed_ref_id"] = df["body"].str.extract(ref_pattern, flags=re.IGNORECASE)[0]
+
+        # -- Entity / recipient extraction --
+        entity_debit_pattern  = (
+            r"(?:trf\s+to|transfer(?:red)?\s+to|paid\s+to|sent\s+to|to)\s+"
+            r"([A-Za-z][A-Za-z0-9 &'._-]{1,35})"
+        )
+        entity_credit_pattern = (
+            r"(?:from|received\s+from|credited\s+(?:from|by)|by\s+a/c\s+linked\s+to)\s+"
+            r"([A-Za-z][A-Za-z0-9 &'._-]{1,35})"
+        )
+        ent_debit  = df["body"].str.extract(entity_debit_pattern,  flags=re.IGNORECASE)[0]
+        ent_credit = df["body"].str.extract(entity_credit_pattern, flags=re.IGNORECASE)[0]
+
+        sender_clean = df["sender"].str.replace(r"^[A-Z]{2}-|-?[A-Z]$", "", regex=True)
+        df["parsed_entity"] = ent_debit.fillna(ent_credit).fillna(sender_clean)
+
+        # -- Final financial label --
+        is_ad = (
+            df["body"].str.contains(ad_keywords_body, na=False)
+            | df["sender"].str.contains(ad_sender, na=False)
+        )
+        has_financial_info = (
+            df["parsed_amount"].notna()
+            & df["parsed_direction"].notna()
+            & (df["parsed_amount"] > 0)
+        )
+        df["parsed_is_financial"] = has_financial_info & (~is_ad)
+
         return df
 
-    def process_all(self):
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
+    def process_all(self, push_to_supabase: bool = False) -> Optional[dict]:
         """
-        Executes the full pipeline:
-        1. Reads data
-        2. Deduplicates exact matches
-        3. Parses regex
-        4. Cross-platform deduplication (SMS vs Notification)
-        5. Saves output CSVs
+        Execute the full CSV pipeline:
+          1. Read captured_sms.csv
+          2. Remove exact duplicates
+          3. Normalize timestamps (handles epoch ms AND ISO strings)
+          4. Filter to current year (2026)
+          5. Parse regex → financial fields
+          6. Cross-platform deduplication (2-min window)
+          7. Save clean_sms_eda.csv and true_financial_sms.csv
+          8. (Optional) Bulk-push financial records to Supabase
+
+        Args:
+            push_to_supabase: If True, attempt to persist each financial row
+                              to Supabase.  Failures are logged and ignored.
+
+        Returns:
+            Summary dict, or None if input file is missing.
         """
         if not os.path.exists(self.input_file):
+            logger.error("Input file %s not found. Sync some data first.", self.input_file)
             print(f"Error: {self.input_file} not found. Please sync some data first!")
-            return
+            return None
 
         print(f"Loading {self.input_file}...")
         df = pd.read_csv(self.input_file)
 
         # 1. Remove exact duplicates
         initial_count = len(df)
-        df = df.drop_duplicates(subset=['body', 'timestamp_ms'])
+        df = df.drop_duplicates(subset=["body", "timestamp_ms"])
         print(f"Removed {initial_count - len(df)} duplicate records.")
 
-        # 2. Handle mixed formats in timestamp_ms (some are epoch ms, some are datetime strings)
-        numeric_ms = pd.to_numeric(df['timestamp_ms'], errors='coerce')
-        dt_from_ms = pd.to_datetime(numeric_ms, unit='ms', errors='coerce')
-        dt_from_str = pd.to_datetime(df['timestamp_ms'], errors='coerce')
-        df['parsed_datetime'] = dt_from_ms.fillna(dt_from_str)
+        # 2. Normalise mixed timestamp formats (epoch ms OR ISO strings)
+        numeric_ms  = pd.to_numeric(df["timestamp_ms"], errors="coerce")
+        dt_from_ms  = pd.to_datetime(numeric_ms, unit="ms", utc=True, errors="coerce")
+        dt_from_str = pd.to_datetime(df["timestamp_ms"], utc=True, errors="coerce")
+        df["parsed_datetime"] = dt_from_ms.fillna(dt_from_str)
 
-        # 3. Filter invalid and non-2026 timestamps
-        invalid_dates = df['parsed_datetime'].isna()
-        if invalid_dates.any():
-            print(f"Dropped {invalid_dates.sum()} records with missing/invalid timestamps.")
-            df = df[~invalid_dates]
+        # 3. Drop invalid timestamps
+        invalid = df["parsed_datetime"].isna()
+        if invalid.any():
+            print(f"Dropped {invalid.sum()} records with missing/invalid timestamps.")
+            df = df[~invalid]
 
-        pre_year_filter_count = len(df)
-        df = df[df['parsed_datetime'].dt.year == 2026].copy()
-        print(f"Dropped {pre_year_filter_count - len(df)} records not from 2026.")
+        # 4. Year filter (2026 only)
+        pre_year = len(df)
+        df = df[df["parsed_datetime"].dt.year == 2026].copy()
+        print(f"Dropped {pre_year - len(df)} records not from 2026.")
 
-        # Sort by actual time
-        df = df.sort_values(by='parsed_datetime', ascending=True)
+        df = df.sort_values("parsed_datetime", ascending=True)
+        df["date"] = df["parsed_datetime"].dt.date.astype(str)
 
-        # 4. Add date column robustly
-        df['date'] = df['parsed_datetime'].dt.date.astype(str)
-
-        # 5. Parse Financial details
+        # 5. Parse financial details
         print("Parsing financial details using Regex...")
         df = self._parse_financial_sms(df)
-        
-        # 5. Overwrite unreliable columns
-        df['is_financial'] = df['parsed_is_financial']
-        df['amount'] = df['parsed_amount']
-        df['direction'] = df['parsed_direction']
-        df['ref_id'] = df['parsed_ref_id']
-        df['entity'] = df['parsed_entity']
-        
 
-        cols_to_drop = ['parsed_is_financial', 'parsed_amount', 'parsed_direction', 'parsed_ref_id', 'parsed_entity']
+        # Promote parsed columns → canonical columns
+        df["is_financial"] = df["parsed_is_financial"]
+        df["amount"]       = df["parsed_amount"]
+        df["direction"]    = df["parsed_direction"]
+        df["ref_id"]       = df["parsed_ref_id"]
+        df["entity"]       = df["parsed_entity"]
+
+        cols_to_drop = [
+            "parsed_is_financial", "parsed_amount",
+            "parsed_direction", "parsed_ref_id", "parsed_entity",
+        ]
         df = df.drop(columns=cols_to_drop)
 
-        # 6. Cross-Platform Deduplication (2-minute window)
-        pre_dedup_count = len(df)
-        
-        # Deduplicate based on amount, direction, and 2-minute time bucket
-        df['time_bucket_2m'] = df['parsed_datetime'].dt.floor('2min')
-        df = df.drop_duplicates(subset=['amount', 'direction', 'time_bucket_2m'])
-        df = df.drop(columns=['time_bucket_2m', 'parsed_datetime'])
-        
-        cross_dup_count = pre_dedup_count - len(df)
-        if cross_dup_count > 0:
-            print(f"Removed {cross_dup_count} cross-platform duplicates (SMS + Notification overlap).")
+        # 6. Cross-platform deduplication (2-min window)
+        pre_dedup = len(df)
+        df["time_bucket_2m"] = df["parsed_datetime"].dt.floor("2min")
+        df = df.drop_duplicates(subset=["amount", "direction", "time_bucket_2m"])
+        df = df.drop(columns=["time_bucket_2m", "parsed_datetime"])
+        cross_dup = pre_dedup - len(df)
+        if cross_dup:
+            print(f"Removed {cross_dup} cross-platform duplicates (SMS + Notification overlap).")
 
-        # 7. Save outputs
+        # 7. Save CSVs
         df.to_csv(self.output_file, index=False)
         print(f"Success! Clean data saved to: {self.output_file}")
-        
-        financial_df = df[df['is_financial'] == True]
+
+        financial_df = df[df["is_financial"] == True]
         financial_df.to_csv(self.financial_output_file, index=False)
         print(f"Saved strictly financial data to: {self.financial_output_file}")
-        
-        return {
-            "total_records": len(df),
-            "financial_count": len(financial_df),
-            "cross_platform_duplicates_removed": cross_dup_count
+
+        # 8. Optional Supabase push
+        supabase_pushed = 0
+        supabase_skipped = 0
+        if push_to_supabase:
+            supabase_pushed, supabase_skipped = self._push_to_supabase(financial_df)
+
+        summary = {
+            "total_records":                len(df),
+            "financial_count":              len(financial_df),
+            "cross_platform_duplicates_removed": cross_dup,
         }
+        if push_to_supabase:
+            summary["supabase_pushed"]  = supabase_pushed
+            summary["supabase_skipped"] = supabase_skipped
+
+        return summary
+
+    # ------------------------------------------------------------------
+    # Optional Supabase push
+    # ------------------------------------------------------------------
+
+    def _push_to_supabase(self, financial_df: pd.DataFrame) -> tuple[int, int]:
+        """
+        Attempt to persist each financial row to Supabase.
+
+        Uses persist_sms_transaction() from service.py.
+        Import is deferred so that the class can run without Supabase if needed.
+        """
+        try:
+            from app.sms_parser import parse_sms_body, normalize_timestamp
+            from app.service import persist_sms_transaction
+        except ImportError as exc:
+            logger.error("Cannot import Supabase service: %s", exc)
+            return 0, len(financial_df)
+
+        pushed  = 0
+        skipped = 0
+
+        for _, row in financial_df.iterrows():
+            try:
+                # Re-parse to get structured ParsedTransaction object
+                parsed = parse_sms_body(
+                    body=str(row.get("body", "")),
+                    sender=str(row.get("sender", "")),
+                )
+
+                if not parsed.is_financial:
+                    skipped += 1
+                    continue
+
+                ts_iso = normalize_timestamp(row.get("timestamp_ms"))
+                result = persist_sms_transaction(
+                    parsed=parsed,
+                    timestamp_iso=ts_iso,
+                    body=str(row.get("body", "")),
+                )
+                if result:
+                    pushed += 1
+                else:
+                    skipped += 1
+
+            except Exception as exc:
+                logger.error("Supabase push failed for row id=%s | %s", row.get("id"), exc)
+                skipped += 1
+
+        print(f"Supabase: pushed={pushed}, skipped/duplicate={skipped}")
+        return pushed, skipped
+
+
+# ------------------------------------------------------------------
+# CLI entry point
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="SpendWise CSV pipeline")
+    parser.add_argument(
+        "--push-supabase",
+        action="store_true",
+        default=False,
+        help="Also push financial transactions to Supabase after CSV processing",
+    )
+    args = parser.parse_args()
+
     processor = FinancialSmsProcessor()
-    processor.process_all()
+    result    = processor.process_all(push_to_supabase=args.push_supabase)
+    if result:
+        print("\n=== Summary ===")
+        for k, v in result.items():
+            print(f"  {k}: {v}")
